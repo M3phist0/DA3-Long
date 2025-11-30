@@ -19,9 +19,16 @@ from LoopModels.LoopModel import LoopDetector
 from LoopModelDBoW.retrieval.retrieval_dbow import RetrievalDBOW
 # from loop_utils.visual_util import segment_sky, download_file_from_url
 
+from vggt.models.vggt import VGGT
+from vggt.utils.load_fn import load_and_preprocess_images
+from vggt.utils.geometry import closed_form_inverse_se3, unproject_depth_map_to_point_map
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
 from pi3.models.pi3 import Pi3
 from pi3.utils.basic import load_images_as_tensor, load_images_as_tensor_pi_long
 from pi3.utils.geometry import depth_edge
+
+from depth_anything_3.api import DepthAnything3
 
 import numpy as np
 
@@ -37,6 +44,89 @@ import matplotlib.pyplot as plt
 import sys
 
 from loop_utils.config_utils import load_config
+
+def ensure_tensor(x, device):
+    """Convert numpy array to torch tensor if needed."""
+    if isinstance(x, np.ndarray):
+        return torch.from_numpy(x).float().to(device)
+    return x.to(device)
+
+def depth_to_world_points(predictions, extrinsic_mode="w2c"):
+    """
+    Convert depth map + intrinsics + extrinsic into world 3D points.
+    Supports numpy or torch input.
+    
+    predictions:
+        depth:      (N,H,W) or (N,1,H,W)
+        intrinsics: (N,3,3)
+        extrinsic:  (N,3,4)
+
+    Returns:
+        points_world: (N, H, W, 3)
+    """
+
+    # detect device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ---- convert depth to tensor ----
+    depth = ensure_tensor(predictions['depth'], device)
+
+    # If input is (N,H,W), reshape to (N,1,H,W)
+    if depth.ndim == 3:
+        depth = depth.unsqueeze(1)   # --> [N,1,H,W]
+    elif depth.ndim == 4:
+        pass
+    else:
+        raise ValueError("depth must be (N,H,W) or (N,1,H,W)")
+
+    K = ensure_tensor(predictions['intrinsics'], device)            # [N,3,3]
+    try:
+        E = ensure_tensor(predictions['camera_poses'], device)      # [N,3,4]
+    except:
+        E = ensure_tensor(predictions['extrinsic'], device)         # [N,3,4]
+        
+    N, _, H, W = depth.shape
+
+    # ---------- 1. pixel grid ----------
+    ys, xs = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+    xs = xs.unsqueeze(0).unsqueeze(0).expand(N, 1, H, W)
+    ys = ys.unsqueeze(0).unsqueeze(0).expand(N, 1, H, W)
+
+    # ---------- 2. intrinsics ----------
+    fx = K[:, 0, 0].view(N, 1, 1, 1)
+    fy = K[:, 1, 1].view(N, 1, 1, 1)
+    cx = K[:, 0, 2].view(N, 1, 1, 1)
+    cy = K[:, 1, 2].view(N, 1, 1, 1)
+
+    z = depth
+    x_cam = (xs - cx) / fx * z
+    y_cam = (ys - cy) / fy * z
+
+    points_cam = torch.cat([x_cam, y_cam, z], dim=1)  # [N,3,H,W]
+    points_cam = points_cam.view(N, 3, -1)            # [N,3,HW]
+
+    # ---------- 3. extrinsic transform ----------
+    R = E[:, :, :3]        # [N,3,3]
+    t = E[:, :, 3:].view(N, 3, 1)
+
+    if extrinsic_mode == "c2w":
+        points_world = torch.matmul(R, points_cam) + t
+    elif extrinsic_mode == "w2c":
+        points_world = torch.matmul(
+            R.transpose(1, 2),
+            points_cam - t
+        )
+    else:
+        raise ValueError("extrinsic_mode must be 'c2w' or 'w2c'")
+
+    points_world = points_world.view(N, 3, H, W)
+    points_world = points_world.permute(0, 2, 3, 1)  # --> [N,H,W,3]
+
+    return points_world.cpu().numpy()
 
 def remove_duplicates(data_list):
     """
@@ -67,10 +157,11 @@ class LongSeqResult:
         self.combined_world_points_confs = []
         self.all_camera_poses = []
 
-class Pi_Long:
-    def __init__(self, image_dir, save_dir, config):
+class X_Long:
+    def __init__(self, image_dir, save_dir, config, Xname: str = 'DA3'):
         self.config = config
 
+        self.Xname = Xname
         self.chunk_size = self.config['Model']['chunk_size']
         self.overlap = self.config['Model']['overlap']
         self.conf_threshold = 1.5
@@ -106,10 +197,19 @@ class Pi_Long:
 
         print('Loading model...')
 
-        self.model = Pi3().to(self.device).eval()
-        _URL = self.config['Weights']['Pi3']
-        from safetensors.torch import load_file
-        weight = load_file(_URL)
+        if Xname == 'Pi3':
+            self.model = Pi3().to(self.device).eval()
+        elif Xname == 'VGGT':
+            self.model = VGGT().to(self.device).eval()
+        elif Xname == 'DA3':
+            self.model = DepthAnything3().to(self.device).eval()
+        _URL = self.config['Weights'][Xname]
+
+        if _URL.endswith('.safetensors'):
+            from safetensors.torch import load_file
+            weight = load_file(_URL)
+        else:
+            weight = torch.load(_URL, map_location='cuda', weights_only=False)
         self.model.load_state_dict(weight, strict=False)
 
         self.skyseg_session = None
@@ -184,27 +284,59 @@ class Pi_Long:
             start_idx, end_idx = range_2
             chunk_image_paths += self.img_list[start_idx:end_idx]
 
-        images = load_images_as_tensor_pi_long(chunk_image_paths).to(self.device)
+        if self.Xname == 'Pi3':
+            images = load_images_as_tensor_pi_long(chunk_image_paths).to(self.device)
+        elif self.Xname == 'VGGT':
+            images = load_and_preprocess_images(chunk_image_paths).to(self.device)
+        elif self.Xname == 'DA3':
+            print(f"Loaded {len(chunk_image_paths)} images")
+            prediction_da3 = self.model.inference(chunk_image_paths)
+            images = prediction_da3.processed_images.transpose(0, 3, 1, 2) / 255.       # [N, 3 ,H, W]
+            predictions = {
+                'depth': prediction_da3.depth,                                          # [N, H, W]
+                'conf': prediction_da3.conf,                                            # [N, H, W]
+                'intrinsics': prediction_da3.intrinsics,                                # [N, 3, 3]
+                'camera_poses': prediction_da3.extrinsics,                              # [N, 3, 4]
+            }
+            
+            points = depth_to_world_points(predictions) # [N, H, W, 3]
+            predictions['points'] = points
+            predictions['images'] = images
+
+            del prediction_da3
+            torch.cuda.empty_cache()
+
+
         print(f"Loaded {len(images)} images")
         
         # images: [B, 3, H, W]
         assert len(images.shape) == 4
         assert images.shape[1] == 3
 
-        torch.cuda.empty_cache()
-        with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=self.dtype):
-                predictions = self.model(images[None])
-        predictions['images'] = images[None]
+        if self.Xname in ['Pi3', 'VGGT']:
+            torch.cuda.empty_cache()
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(dtype=self.dtype):
+                    predictions = self.model(images[None])
+
+            predictions['images'] = images[None]
 
         # see issue https://github.com/yyfz/Pi3/issues/55
-        conf = predictions['conf']
-        conf = torch.sigmoid(conf)
-        predictions['conf'] = conf
+        if self.Xname == 'Pi3':
+            conf = predictions['conf']
+            conf = torch.sigmoid(conf)
+            predictions['conf'] = conf
         torch.cuda.empty_cache()
 
-
         print("Processing model outputs...")
+
+        if self.Xname == "VGGT":
+            print("Converting pose encoding to extrinsic and intrinsic matrices...")
+            extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
+            predictions["intrinsic"] = intrinsic
+            predictions["camera_poses"] = extrinsic
+            predictions["points"] = predictions.pop("world_points")
+            predictions["conf"] = predictions.pop("world_points_conf")
         
         if self.temp_files_location == 'cpu_memory':
             if is_loop:
@@ -220,7 +352,7 @@ class Pi_Long:
                     predictions_cpu[k] = v.cpu().numpy().squeeze(0)
             
             if not is_loop and range_2 is None:
-                extrinsics = predictions_cpu['camera_poses']
+                extrinsics = predictions['camera_poses']
                 chunk_range = self.chunk_indices[chunk_idx]
                 self.all_camera_poses.append((chunk_range, extrinsics))
             
@@ -247,6 +379,13 @@ class Pi_Long:
                 extrinsics = predictions['camera_poses']
                 chunk_range = self.chunk_indices[chunk_idx]
                 self.all_camera_poses.append((chunk_range, extrinsics))
+            
+            if self.Xname == "VGGT":
+                predictions['depth'] = np.squeeze(predictions['depth'])
+
+            # print("predictions analyze...")
+            # for key in predictions.keys():
+            #     print("[key|shape|type]:", key, predictions[key].shape, type(predictions[key]))
 
             np.save(save_path, predictions)
             
@@ -264,6 +403,8 @@ class Pi_Long:
             self.chunk_indices = []
             for i in range(num_chunks):
                 start_idx = i * step
+                if start_idx + self.chunk_size > len(self.img_list): # my add
+                    start_idx = max(0, len(self.img_list) - self.chunk_size)
                 end_idx = min(start_idx + self.chunk_size, len(self.img_list))
                 self.chunk_indices.append((start_idx, end_idx))
         
@@ -448,9 +589,9 @@ class Pi_Long:
                     chunk_data_first = self.temp_storage[f"chunk_0"]
                 else:
                     chunk_data_first = np.load(os.path.join(self.result_unaligned_dir, f"chunk_0.npy"), allow_pickle=True).item()
-                points = chunk_data_first['points'].reshape(-1, 3)
-                colors = (chunk_data_first['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
+                points = aligned_chunk_data['points'].reshape(-1, 3)
                 confs = chunk_data_first['conf'].reshape(-1)
+                colors = (chunk_data_first['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
                 ply_path = os.path.join(self.pcd_dir, f'{chunk_idx}_pcd.ply')
                 save_confident_pointcloud_batch(
                     points=points,              # shape: (H, W, 3)
@@ -467,8 +608,8 @@ class Pi_Long:
                 aligned_chunk_data = np.load(os.path.join(self.result_aligned_dir, f"chunk_{chunk_idx}.npy"), allow_pickle=True).item() if chunk_idx > 0 else chunk_data_first
             
             points = aligned_chunk_data['points'].reshape(-1, 3)
-            colors = (aligned_chunk_data['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
             confs = aligned_chunk_data['conf'].reshape(-1)
+            colors = (aligned_chunk_data['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
             ply_path = os.path.join(self.pcd_dir, f'{chunk_idx+1}_pcd.ply')
             save_confident_pointcloud_batch(
                 points=points,              # shape: (H, W, 3)
@@ -478,6 +619,26 @@ class Pi_Long:
                 conf_threshold=np.mean(confs) * self.config['Model']['Pointcloud_Save']['conf_threshold_coef'],
                 sample_ratio=self.config['Model']['Pointcloud_Save']['sample_ratio']
             )
+
+        if len(self.chunk_indices) == 1:
+            chunk_data_first = np.load(os.path.join(self.result_unaligned_dir, f"chunk_0.npy"), allow_pickle=True).item()
+            np.save(os.path.join(self.result_aligned_dir, "chunk_0.npy"), chunk_data_first)
+            
+            aligned_chunk_data = np.load(os.path.join(self.result_aligned_dir, f"chunk_{chunk_idx}.npy"), allow_pickle=True).item() if chunk_idx > 0 else chunk_data_first
+            
+            points = aligned_chunk_data['points'].reshape(-1, 3)
+            confs = aligned_chunk_data['conf'].reshape(-1)
+            colors = (aligned_chunk_data['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
+            ply_path = os.path.join(self.pcd_dir, f'{chunk_idx}_pcd.ply')
+            save_confident_pointcloud_batch(
+                points=points,              # shape: (H, W, 3)
+                colors=colors,              # shape: (H, W, 3)
+                confs=confs,          # shape: (H, W)
+                output_path=ply_path,
+                conf_threshold=np.mean(confs) * self.config['Model']['Pointcloud_Save']['conf_threshold_coef'],
+                sample_ratio=self.config['Model']['Pointcloud_Save']['sample_ratio']
+            )
+
 
         self.save_camera_poses()
         
@@ -673,11 +834,11 @@ if __name__ == '__main__':
     if config['Model']['align_method'] == 'numba':
         warmup_numba()
 
-    pi_long = Pi_Long(image_dir, save_dir, config)
-    pi_long.run()
-    pi_long.close()
+    x_long = X_Long(image_dir, save_dir, config)
+    x_long.run()
+    x_long.close()
 
-    del pi_long
+    del x_long
     torch.cuda.empty_cache()
     gc.collect()
 
