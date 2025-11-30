@@ -290,7 +290,7 @@ class X_Long:
             images = load_and_preprocess_images(chunk_image_paths).to(self.device)
         elif self.Xname == 'DA3':
             print(f"Loaded {len(chunk_image_paths)} images")
-            prediction_da3 = self.model.inference(chunk_image_paths)
+            prediction_da3 = self.model.inference(chunk_image_paths, process_res=600)
             images = prediction_da3.processed_images.transpose(0, 3, 1, 2) / 255.       # [N, 3 ,H, W]
             predictions = {
                 'depth': prediction_da3.depth,                                          # [N, H, W]
