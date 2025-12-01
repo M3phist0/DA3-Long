@@ -1,6 +1,7 @@
 import numpy as np
 import argparse
 
+import open3d as o3d
 import os
 import glob
 import threading
@@ -14,6 +15,9 @@ try:
     import onnxruntime
 except ImportError:
     print("onnxruntime not found. Sky segmentation may not work.")
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
 from LoopModels.LoopModel import LoopDetector
 from LoopModelDBoW.retrieval.retrieval_dbow import RetrievalDBOW
@@ -36,6 +40,8 @@ from loop_utils.sim3loop import Sim3LoopOptimizer
 from loop_utils.sim3utils import *
 from datetime import datetime
 
+import loop_utils.colmap as colmap_utils
+
 from PIL import Image
 
 import matplotlib
@@ -45,13 +51,89 @@ import sys
 
 from loop_utils.config_utils import load_config
 
+import mkl
+mkl.get_max_threads()
+
+def sor_with_mask(points: np.ndarray, mask: np.ndarray, k: int = 20, std_ratio: float = 2.0) -> np.ndarray:
+    """
+    使用 Open3D 的 Statistical Outlier Removal, 仅对 mask==True 的点执行，
+    返回与输入等长的新掩码 (True 表示保留)
+    - 优先尝试 Open3D Tensor/GPU 路径以加速，失败则自动回退到 legacy 路径.
+    - 不改变函数签名与返回值。
+    """
+    assert points.ndim == 2 and points.shape[1] == 3, "points 必须是 (N,3)"
+    assert mask.ndim == 1 and mask.shape[0] == points.shape[0], "mask 尺寸不匹配"
+
+    valid_idx = np.nonzero(mask)[0]
+    n_valid = int(valid_idx.size)
+    if n_valid == 0:
+        return mask.copy()
+    if n_valid <= k:
+        return mask.copy()
+
+    # 准备有效子集
+    valid_points = points[valid_idx]
+    # Open3D legacy Vector3dVector 需要 float64；Tensor 可用 float32/64
+    valid_points64 = valid_points.astype(np.float64, copy=False)
+
+    # 夹紧 k，避免越界与无意义计算
+    k = min(max(1, k), n_valid - 1)
+
+    # ---------- 优先：Tensor/GPU 路径（若可用则更快） ----------
+    def _try_tensor_sor(vpts: np.ndarray) -> np.ndarray | None:
+        try:
+            has_t = hasattr(o3d, "t") and hasattr(o3d.t, "geometry")
+            if not has_t:
+                return None
+
+            # 设备选择：有 CUDA 则用 GPU，否则 CPU
+            try:
+                dev = o3d.core.Device("CUDA:0") if hasattr(o3d.core, "cuda") and o3d.core.cuda.is_available() \
+                      else o3d.core.Device("CPU:0")
+            except Exception:
+                dev = o3d.core.Device("CPU:0")
+
+            tpcd = o3d.t.geometry.PointCloud(device=dev)
+            # 用 float32 节省显存/内存（数值上对 SOR 足够）
+            tpcd.point["positions"] = o3d.core.Tensor(vpts.astype(np.float32, copy=False),
+                                                      dtype=o3d.core.Dtype.Float32, device=dev)
+
+            # 兼容不同版本的 API 名称
+            if hasattr(tpcd, "remove_statistical_outliers"):
+                _, inlier_mask = tpcd.remove_statistical_outliers(nb_neighbors=k, std_ratio=std_ratio)
+            elif hasattr(tpcd, "remove_statistical_outlier"):
+                _, inlier_mask = tpcd.remove_statistical_outlier(nb_neighbors=k, std_ratio=std_ratio)
+            else:
+                return None
+
+            inlier_mask = inlier_mask.cpu().numpy().astype(bool, copy=False)
+            return inlier_mask
+        except Exception:
+            return None
+
+    keep_local = _try_tensor_sor(valid_points)
+    if keep_local is None:
+        # ---------- 回退：legacy 路径（你原来的实现） ----------
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(valid_points64)
+        # 返回 (filtered_pcd, inlier_indices)
+        _, inlier_indices = pcd.remove_statistical_outlier(nb_neighbors=k, std_ratio=std_ratio)
+        keep_local = np.zeros(n_valid, dtype=bool)
+        if len(inlier_indices) > 0:
+            keep_local[np.asarray(inlier_indices, dtype=int)] = True
+
+    # 映射回全局 mask
+    new_mask = mask.copy()
+    new_mask[valid_idx] = keep_local
+    return new_mask
+
 def ensure_tensor(x, device):
     """Convert numpy array to torch tensor if needed."""
     if isinstance(x, np.ndarray):
         return torch.from_numpy(x).float().to(device)
     return x.to(device)
 
-def depth_to_world_points(predictions, extrinsic_mode="w2c"):
+def depth_to_world_points(predictions, extrinsic_mode="c2w"):
     """
     Convert depth map + intrinsics + extrinsic into world 3D points.
     Supports numpy or torch input.
@@ -158,7 +240,7 @@ class LongSeqResult:
         self.all_camera_poses = []
 
 class X_Long:
-    def __init__(self, image_dir, save_dir, config, Xname: str = 'DA3'):
+    def __init__(self, image_dir, sparse_dir, save_dir, config, Xname: str = 'DA3'):
         self.config = config
 
         self.Xname = Xname
@@ -173,7 +255,9 @@ class X_Long:
 
         self.img_dir = image_dir
         self.img_list = None
+        self.sparse_dir = sparse_dir
         self.output_dir = save_dir
+        self.point_max_error = config['Model']['point_max_error']
 
         self.result_unaligned_dir = os.path.join(save_dir, '_tmp_results_unaligned')
         self.result_aligned_dir = os.path.join(save_dir, '_tmp_results_aligned')
@@ -277,6 +361,163 @@ class X_Long:
             self.loop_detector.run()
             self.loop_list = self.loop_detector.get_loop_list()
 
+    def align_with_colmap(self, image_paths, images_tensor, predictions):
+        print("Align with colmap...")
+        img_names = [os.path.basename(img_path) for img_path in image_paths]
+        local_points = predictions["local_points"]
+        camera_poses = predictions["camera_poses"]
+        conf = predictions["conf"]
+
+        cameras = self.colmap_cameras
+        images = self.colmap_images
+        name2key = self.colmap_name2key
+
+        points3d_ordered = self.colmap_points3d_ordered
+        points3d_error_ordered = self.colmap_points3d_error_ordered
+        points3d_rgb_ordered = self.colmap_rgb_ordered
+
+        aabb = None
+        if 'aerial' in image_paths[0]: # chunk_len = 90
+            aabb = [-12, -8, -1, 11, 9, 6]
+        elif 'street' in image_paths[0]: # chunk_len = 15
+            aabb = [-950, -650, -5, 200, 300, 100]
+
+        if aabb is not None and not hasattr(self, 'colmap_mask'):
+            valid_x = (points3d_ordered[:, 0] > aabb[0]) & (points3d_ordered[:, 0] < aabb[3])
+            valid_y = (points3d_ordered[:, 1] > aabb[1]) & (points3d_ordered[:, 1] < aabb[4])
+            valid_z = (points3d_ordered[:, 2] > aabb[2]) & (points3d_ordered[:, 2] < aabb[5])
+            self.colmap_mask = valid_x & valid_y & valid_z
+
+            if 'street' in image_paths[0]:
+                sor_mask = self.colmap_mask
+                for i in range(1):
+                    sor_mask = sor_with_mask(points3d_ordered, sor_mask, k=6, std_ratio=1.0)
+                self.colmap_mask = sor_mask
+
+        N, _, H, W = images_tensor.shape
+
+        point_max_error = self.point_max_error
+
+        pts_list = []
+        pred_pts_list = []
+        pred_conf_list = []
+        pred_colors_list = []
+
+        for idx, name in enumerate(img_names):
+            if name not in name2key:
+                print("No image:", name)
+                continue
+            key = name2key[name]
+            image_meta = images[key]
+            cam_intrinsic = cameras[image_meta.camera_id]
+            pts_idx = images[key].point3D_ids
+
+            # filter out invalid 3D points
+            mask = pts_idx >= 0
+            mask *= pts_idx < len(points3d_ordered)
+
+            # get valid 3D point indices and 2D point xy
+            pts_idx = pts_idx[mask]
+            valid_xys = image_meta.xys[mask]
+
+            # reduce outliers
+            if len(pts_idx) > 0:
+                pts_errors = points3d_error_ordered[pts_idx]
+                valid_errors = pts_errors < point_max_error
+                if aabb is not None:
+                    # valid_x = (points3d_ordered[:, 0] > aabb[0]) & (points3d_ordered[:, 0] < aabb[3])
+                    # valid_y = (points3d_ordered[:, 1] > aabb[1]) & (points3d_ordered[:, 1] < aabb[4])
+                    # valid_z = (points3d_ordered[:, 2] > aabb[2]) & (points3d_ordered[:, 2] < aabb[5])
+                    valid_mask = self.colmap_mask
+                    valid_mask = valid_mask[pts_idx]
+                    valid_errors = valid_errors & valid_mask
+
+                pts_idx = pts_idx[valid_errors]
+                valid_xys = valid_xys[valid_errors]
+
+                # print("min max:", points3d_ordered.shape, points3d_ordered.min(), points3d_ordered.max(), pts_errors.shape)
+
+            else:
+                print("no outliers")
+
+            if len(pts_idx) > 0:
+                # get 3D point xyz
+                pts = points3d_ordered[pts_idx]
+            else:
+                pts = np.array([0, 0, 0])
+            pts_ori = pts.copy()
+
+            # transform from world to camera
+            R = colmap_utils.qvec2rotmat(image_meta.qvec)
+            pts = np.dot(pts, R.T) + image_meta.tvec
+
+            invcolmapdepth = 1. / pts[..., 2]
+            invmonodepthmap = 1. / local_points[idx][..., 2]
+            pred_conf = conf[idx]
+            pred_pose = camera_poses[idx]
+            pred_xy = local_points[idx][..., :2] / local_points[idx][..., 2:]
+
+            resized_invmonodepthmap = cv2.resize(
+                invmonodepthmap, 
+                dsize=(cam_intrinsic.width, cam_intrinsic.height), 
+                interpolation=cv2.INTER_LINEAR
+            )
+
+            invdepth_norm = (resized_invmonodepthmap - resized_invmonodepthmap.min()) / (resized_invmonodepthmap.max() - resized_invmonodepthmap.min())
+            depth = (invdepth_norm * 255).clip(0, 255).astype(np.uint8)
+            colored_depth = cv2.applyColorMap(depth, cv2.COLORMAP_JET)
+
+            # os.makedirs("depths", exist_ok=True)
+            # depth_save_path = os.path.join("depths", name)
+            # cv2.imwrite(depth_save_path , colored_depth)
+
+            s = W / cam_intrinsic.width, H / cam_intrinsic.height
+            maps = (valid_xys * s).astype(np.float32)
+            valid = (
+                (maps[..., 0] >= 0) *
+                (maps[..., 1] >= 0) *
+                (maps[..., 0] < cam_intrinsic.width * s[0]) *
+                (maps[..., 1] < cam_intrinsic.height * s[1]) * (invcolmapdepth > 0))
+            
+            if valid.sum() > 10 and (invcolmapdepth.max() - invcolmapdepth.min()) > 1e-3:
+                pts_ori = pts_ori[valid, :]
+                maps = maps[valid, :]
+                invcolmapdepth = invcolmapdepth[valid]
+                invmonodepth = cv2.remap(invmonodepthmap, maps[..., 0], maps[..., 1], interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[..., 0]
+                remap_x = cv2.remap(pred_xy[..., 0], maps[..., 0], maps[..., 1], interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[..., 0]
+                remap_y = cv2.remap(pred_xy[..., 1], maps[..., 0], maps[..., 1], interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[..., 0]
+                remap_conf = cv2.remap(pred_conf, maps[..., 0], maps[..., 1], interpolation=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REPLICATE)[..., 0]
+                monodepth = 1. / invmonodepth
+                pred_xyz = np.column_stack([remap_x * monodepth, remap_y * monodepth, monodepth])
+                pred_pts = torch.einsum('ij, nj -> ni', torch.tensor(pred_pose), homogenize_points(torch.tensor(pred_xyz)))[..., :3].numpy()
+                pts_list.append(pts_ori)
+                pred_pts_list.append(pred_pts)
+                pred_conf_list.append(remap_conf)
+
+                img_rgb = images_tensor[idx].permute(1, 2, 0).cpu().numpy().astype(np.float32)
+                img_rgb_255 = (img_rgb * 255).astype(np.uint8)
+                remap_rgb = cv2.remap(img_rgb_255, maps[..., 0], maps[..., 1], interpolation=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REPLICATE)
+                
+                pred_colors_list.append(remap_rgb)
+
+        colmap_pts = np.concatenate(pts_list)[np.newaxis, ...]
+        colmap_conf = np.ones(colmap_pts.shape[1])[np.newaxis, ...]
+        pred_pts = np.concatenate(pred_pts_list)[np.newaxis, ...]
+        pred_conf = np.concatenate(pred_conf_list)[np.newaxis, ...]
+
+        conf_threshold = np.median(pred_conf) * 0.01
+        s, R, t = weighted_align_point_maps(colmap_pts, colmap_conf, pred_pts, pred_conf, conf_threshold=conf_threshold, config=self.config)
+
+        S = np.eye(4)
+        S[:3, :3] = s * R
+        S[:3, 3] = t
+        c2w = camera_poses
+        transformed_c2w = S @ c2w  # Be aware of the left multiplication!
+        assert predictions['camera_poses'].shape == transformed_c2w.shape
+
+        predictions['points'] = apply_sim3_direct(predictions['points'], s, R, t)
+        predictions['camera_poses'] = transformed_c2w
+
     def process_single_chunk(self, range_1, chunk_idx=None, range_2=None, is_loop=False):
         start_idx, end_idx = range_1
         chunk_image_paths = self.img_list[start_idx:end_idx]
@@ -292,20 +533,20 @@ class X_Long:
             print(f"Loaded {len(chunk_image_paths)} images")
             prediction_da3 = self.model.inference(chunk_image_paths, process_res=600)
             images = prediction_da3.processed_images.transpose(0, 3, 1, 2) / 255.       # [N, 3 ,H, W]
+
             predictions = {
-                'depth': prediction_da3.depth,                                          # [N, H, W]
-                'conf': prediction_da3.conf,                                            # [N, H, W]
-                'intrinsics': prediction_da3.intrinsics,                                # [N, 3, 3]
-                'camera_poses': prediction_da3.extrinsics,                              # [N, 3, 4]
+                'depth': prediction_da3.depth,                                  # [N, H, W]
+                'conf': prediction_da3.conf,                                    # [N, H, W]
+                'intrinsics': prediction_da3.intrinsics,                        # [N, 3, 3]
+                'camera_poses': prediction_da3.extrinsics,                      # [N, 3, 4]
             }
             
-            points = depth_to_world_points(predictions) # [N, H, W, 3]
+            points = depth_to_world_points(predictions, extrinsic_mode="w2c")   # [N, H, W, 3]
             predictions['points'] = points
             predictions['images'] = images
 
             del prediction_da3
             torch.cuda.empty_cache()
-
 
         print(f"Loaded {len(images)} images")
         
@@ -337,6 +578,9 @@ class X_Long:
             predictions["camera_poses"] = extrinsic
             predictions["points"] = predictions.pop("world_points")
             predictions["conf"] = predictions.pop("world_points_conf")
+        
+        if self.sparse_dir:
+            self.align_with_colmap(chunk_image_paths, images, predictions)
         
         if self.temp_files_location == 'cpu_memory':
             if is_loop:
@@ -408,6 +652,26 @@ class X_Long:
                 end_idx = min(start_idx + self.chunk_size, len(self.img_list))
                 self.chunk_indices.append((start_idx, end_idx))
         
+        if self.sparse_dir:
+            cameras, images, points3d = colmap_utils.read_model(self.sparse_dir)
+            name2key = {images[key].name: key for key in images}
+
+            pts_indices = np.array([points3d[key].id for key in points3d])
+            pts_xyzs = np.array([points3d[key].xyz for key in points3d])
+            pts_errors = np.array([points3d[key].error for key in points3d])
+            points3d_ordered = np.zeros([pts_indices.max() + 1, 3])
+            points3d_error_ordered = np.zeros([pts_indices.max() + 1, ])
+            points3d_ordered[pts_indices] = pts_xyzs
+            points3d_error_ordered[pts_indices] = pts_errors
+            rgb_ordered = np.zeros([pts_indices.max() + 1, 3])
+
+            self.colmap_cameras = cameras
+            self.colmap_images = images
+            self.colmap_name2key = name2key
+            self.colmap_points3d_ordered = points3d_ordered
+            self.colmap_points3d_error_ordered = points3d_error_ordered
+            self.colmap_rgb_ordered = rgb_ordered
+
         if self.loop_enable:
             print('Loop SIM(3) estimating...')
             loop_results = process_loop_list(self.chunk_indices, 
@@ -589,7 +853,7 @@ class X_Long:
                     chunk_data_first = self.temp_storage[f"chunk_0"]
                 else:
                     chunk_data_first = np.load(os.path.join(self.result_unaligned_dir, f"chunk_0.npy"), allow_pickle=True).item()
-                points = aligned_chunk_data['points'].reshape(-1, 3)
+                points = chunk_data_first['points'].reshape(-1, 3)
                 confs = chunk_data_first['conf'].reshape(-1)
                 colors = (chunk_data_first['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
                 ply_path = os.path.join(self.pcd_dir, f'{chunk_idx}_pcd.ply')
@@ -648,7 +912,8 @@ class X_Long:
     def run(self):
         print(f"Loading images from {self.img_dir}...")
         self.img_list = sorted(glob.glob(os.path.join(self.img_dir, "*.jpg")) + 
-                                glob.glob(os.path.join(self.img_dir, "*.png")))
+                                glob.glob(os.path.join(self.img_dir, "*.png")) + 
+                                glob.glob(os.path.join(self.img_dir, "*.JPG")))
         # print(self.img_list)
         if len(self.img_list) == 0:
             raise ValueError(f"[DIR EMPTY] No images found in {self.img_dir}!")
@@ -703,8 +968,12 @@ class X_Long:
             S[:3, 3] = t
 
             for i, idx in enumerate(range(chunk_range[0], chunk_range[1])):
-
-                c2w = chunk_extrinsics[i] # camera pose of Pi3 is C2W while it is W2C in VGGT!
+                if self.Xname == 'Pi3':
+                    c2w = chunk_extrinsics[i] # camera pose of Pi3 is C2W while it is W2C in VGGT!
+                elif self.Xname in ['VGGT', 'DA3']:
+                    w2c = np.eye(4)
+                    w2c[:3, :] = chunk_extrinsics[i]
+                    c2w = np.linalg.inv(w2c)
 
                 transformed_c2w = S @ c2w  # Be aware of the left multiplication!
                 transformed_c2w[:3, :3] /= s  # Normalize rotation
@@ -808,6 +1077,10 @@ if __name__ == '__main__':
                         help='Image path')
     parser.add_argument('--config', type=str, required=False, default='./configs/base_config.yaml',
                         help='Image path')
+    parser.add_argument('--sparse_dir', type=str, required=False, default=None,
+                        help='sparse path')
+    parser.add_argument('--Xname', '-x', type=str, required=False, default='DA3',
+                        help='sparse path')
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -817,6 +1090,9 @@ if __name__ == '__main__':
     current_datetime = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     exp_dir = './exps'
 
+    sparse_dir = args.sparse_dir
+    if sparse_dir and os.path.isdir(os.path.join(sparse_dir, "0")):
+        sparse_dir = os.path.join(sparse_dir, "0")
 
     save_dir = os.path.join(
             exp_dir, image_dir.replace("/", "_"), current_datetime
@@ -834,9 +1110,13 @@ if __name__ == '__main__':
     if config['Model']['align_method'] == 'numba':
         warmup_numba()
 
-    x_long = X_Long(image_dir, save_dir, config)
+    import time
+    start_time = time.time()
+    x_long = X_Long(image_dir, sparse_dir, save_dir, config, args.Xname)
     x_long.run()
     x_long.close()
+    end_time = time.time()
+    print(f"Time cosume:{end_time - start_time:.2f}s")
 
     del x_long
     torch.cuda.empty_cache()
