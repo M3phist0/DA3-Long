@@ -30,7 +30,7 @@ from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 from pi3.models.pi3 import Pi3
 from pi3.utils.basic import load_images_as_tensor, load_images_as_tensor_pi_long
-from pi3.utils.geometry import depth_edge
+from pi3.utils.geometry import depth_edge, homogenize_points
 
 from depth_anything_3.api import DepthAnything3
 
@@ -127,7 +127,7 @@ def sor_with_mask(points: np.ndarray, mask: np.ndarray, k: int = 20, std_ratio: 
     new_mask[valid_idx] = keep_local
     return new_mask
 
-def ensure_tensor(x, device):
+def ensure_tensor(x, device='cpu'):
     """Convert numpy array to torch tensor if needed."""
     if isinstance(x, np.ndarray):
         return torch.from_numpy(x).float().to(device)
@@ -209,6 +209,36 @@ def depth_to_world_points(predictions, extrinsic_mode="c2w"):
     points_world = points_world.permute(0, 2, 3, 1)  # --> [N,H,W,3]
 
     return points_world.cpu().numpy()
+
+def depth_to_local_points(depth, intrinsics):
+    """
+    depth:      (N, H, W)
+    intrinsics: (N, 3, 3)  each with fx, fy, cx, cy
+    return:     (N, H, W, 3) float32
+    """
+    N, H, W = depth.shape
+
+    # ----- pixel grid -----
+    u = np.arange(W)
+    v = np.arange(H)
+    u, v = np.meshgrid(u, v, indexing="xy")  # (H, W)
+
+    # broadcast to (N, H, W)
+    u = np.broadcast_to(u, (N, H, W))
+    v = np.broadcast_to(v, (N, H, W))
+
+    # ----- intrinsics -----
+    fx = intrinsics[:, 0, 0].reshape(N, 1, 1)
+    fy = intrinsics[:, 1, 1].reshape(N, 1, 1)
+    cx = intrinsics[:, 0, 2].reshape(N, 1, 1)
+    cy = intrinsics[:, 1, 2].reshape(N, 1, 1)
+
+    Z = depth
+    X = (u - cx) / fx * Z
+    Y = (v - cy) / fy * Z
+
+    # stack into (N, H, W, 3)
+    return np.stack([X, Y, Z], axis=-1).astype(np.float32)
 
 def remove_duplicates(data_list):
     """
@@ -368,6 +398,19 @@ class X_Long:
         camera_poses = predictions["camera_poses"]
         conf = predictions["conf"]
 
+        if self.Xname in ['VGGT', 'DA3']:
+            c2w_34 = camera_poses          # (N,3,4)
+            R = c2w_34[..., :3]            # (N,3,3)
+            t = c2w_34[..., 3]             # (N,3)
+
+            Rt = np.transpose(R, (0, 2, 1))                    # (N,3,3)  = R^T
+            t_inv = -np.einsum('nij,nj->ni', Rt, t)            # (N,3)    = -R^T t
+
+            w2c_44 = np.tile(np.eye(4)[None, ...], (c2w_34.shape[0], 1, 1))  # (N,4,4)
+            w2c_44[:, :3, :3] = Rt
+            w2c_44[:, :3, 3] = t_inv
+            camera_poses = w2c_44.astype(np.float32)
+        
         cameras = self.colmap_cameras
         images = self.colmap_images
         name2key = self.colmap_name2key
@@ -425,17 +468,12 @@ class X_Long:
                 pts_errors = points3d_error_ordered[pts_idx]
                 valid_errors = pts_errors < point_max_error
                 if aabb is not None:
-                    # valid_x = (points3d_ordered[:, 0] > aabb[0]) & (points3d_ordered[:, 0] < aabb[3])
-                    # valid_y = (points3d_ordered[:, 1] > aabb[1]) & (points3d_ordered[:, 1] < aabb[4])
-                    # valid_z = (points3d_ordered[:, 2] > aabb[2]) & (points3d_ordered[:, 2] < aabb[5])
                     valid_mask = self.colmap_mask
                     valid_mask = valid_mask[pts_idx]
                     valid_errors = valid_errors & valid_mask
 
                 pts_idx = pts_idx[valid_errors]
                 valid_xys = valid_xys[valid_errors]
-
-                # print("min max:", points3d_ordered.shape, points3d_ordered.min(), points3d_ordered.max(), pts_errors.shape)
 
             else:
                 print("no outliers")
@@ -511,12 +549,17 @@ class X_Long:
         S = np.eye(4)
         S[:3, :3] = s * R
         S[:3, 3] = t
-        c2w = camera_poses
+        w2c = camera_poses
+        c2w = np.linalg.inv(w2c)
         transformed_c2w = S @ c2w  # Be aware of the left multiplication!
-        assert predictions['camera_poses'].shape == transformed_c2w.shape
+        # if self.Xname == 'Pi3':
+        #     assert predictions['camera_poses'].shape == transformed_c2w.shape
 
         predictions['points'] = apply_sim3_direct(predictions['points'], s, R, t)
-        predictions['camera_poses'] = transformed_c2w
+        if self.Xname == 'Pi3':
+            predictions['camera_poses'] = np.linalg.inv(transformed_c2w)
+        elif self.Xname in ['VGGT', 'DA3']:
+            predictions['camera_poses'] = transformed_c2w[:, :3, :]
 
     def process_single_chunk(self, range_1, chunk_idx=None, range_2=None, is_loop=False):
         start_idx, end_idx = range_1
@@ -531,8 +574,9 @@ class X_Long:
             images = load_and_preprocess_images(chunk_image_paths).to(self.device)
         elif self.Xname == 'DA3':
             print(f"Loaded {len(chunk_image_paths)} images")
-            prediction_da3 = self.model.inference(chunk_image_paths, process_res=600)
+            prediction_da3 = self.model.inference(chunk_image_paths)
             images = prediction_da3.processed_images.transpose(0, 3, 1, 2) / 255.       # [N, 3 ,H, W]
+            images = ensure_tensor(images)
 
             predictions = {
                 'depth': prediction_da3.depth,                                  # [N, H, W]
@@ -543,7 +587,7 @@ class X_Long:
             
             points = depth_to_world_points(predictions, extrinsic_mode="w2c")   # [N, H, W, 3]
             predictions['points'] = points
-            predictions['images'] = images
+            # predictions['images'] = images
 
             del prediction_da3
             torch.cuda.empty_cache()
@@ -560,7 +604,7 @@ class X_Long:
                 with torch.cuda.amp.autocast(dtype=self.dtype):
                     predictions = self.model(images[None])
 
-            predictions['images'] = images[None]
+        predictions['images'] = images[None]
 
         # see issue https://github.com/yyfz/Pi3/issues/55
         if self.Xname == 'Pi3':
@@ -579,8 +623,12 @@ class X_Long:
             predictions["points"] = predictions.pop("world_points")
             predictions["conf"] = predictions.pop("world_points_conf")
         
-        if self.sparse_dir:
-            self.align_with_colmap(chunk_image_paths, images, predictions)
+        if self.Xname in ['DA3', 'VGGT']:
+            local_points = depth_to_local_points(
+                predictions['depth'],
+                predictions['intrinsics']
+            )  # (N, H, W, 3)
+            predictions['local_points'] = local_points
         
         if self.temp_files_location == 'cpu_memory':
             if is_loop:
@@ -607,6 +655,9 @@ class X_Long:
                 if isinstance(predictions[key], torch.Tensor):
                     predictions[key] = predictions[key].cpu().numpy().squeeze(0)
             
+            if self.sparse_dir:
+                self.align_with_colmap(chunk_image_paths, images, predictions)
+
             # Save predictions to disk instead of keeping in memory
             if is_loop:
                 save_dir = self.result_loop_dir
@@ -627,9 +678,9 @@ class X_Long:
             if self.Xname == "VGGT":
                 predictions['depth'] = np.squeeze(predictions['depth'])
 
-            # print("predictions analyze...")
-            # for key in predictions.keys():
-            #     print("[key|shape|type]:", key, predictions[key].shape, type(predictions[key]))
+            print("predictions analyze...")
+            for key in predictions.keys():
+                print("[key|shape|type]:", key, predictions[key].shape, type(predictions[key]))
 
             np.save(save_path, predictions)
             

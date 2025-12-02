@@ -118,8 +118,59 @@ def apply_sim3_direct(point_maps, s, R, t):
 
     return transformed
 
+def _compute_alignment_error_flat(point_map1, conf1, point_map2, conf2, conf_threshold, s, R, t):
+    """
+    Compute the average point alignment error for (b, n) shaped inputs.
+    """
+    b1, n1, _ = point_map1.shape
+    b2, n2, _ = point_map2.shape
+    b = min(b1, b2)
+    n = min(n1, n2)
+    
+    target_points = []
+    source_points = []
+    
+    for i in range(b):
+        mask1 = conf1[i, :n] > conf_threshold
+        mask2 = conf2[i, :n] > conf_threshold
+        valid_mask = mask1 & mask2
+
+        idx = np.where(valid_mask)
+        if len(idx[0]) == 0:
+            continue
+            
+        t_pts = point_map1[i, :n][idx]
+        s_pts = point_map2[i, :n][idx]
+        
+        target_points.append(t_pts)
+        source_points.append(s_pts)
+    
+    if len(target_points) == 0:
+        print("Warning: No matching point pairs found for error calculation")
+        return np.nan
+    
+    all_target = np.concatenate(target_points, axis=0)
+    all_source = np.concatenate(source_points, axis=0)
+    
+    transformed = (s * (R @ all_source.T)).T + t
+    
+    errors = np.linalg.norm(transformed - all_target, axis=1)
+    
+    mean_error = np.mean(errors)
+    std_error = np.std(errors)
+    median_error = np.median(errors)
+    max_error = np.max(errors)
+    
+    print(f"Alignment error statistics [using {len(errors)} points]: "
+          f"mean={mean_error:.4f}, std={std_error:.4f}, "
+          f"median={median_error:.4f}, max={max_error:.4f}")
+    
+    return median_error
 
 def compute_alignment_error(point_map1, conf1, point_map2, conf2, conf_threshold, s, R, t):
+    if point_map1.ndim == 3:
+        # 形状为 (B, N, 3)，直接调用flat函数
+        return _compute_alignment_error_flat(point_map1, conf1, point_map2, conf2, conf_threshold, s, R, t)
     """
     Compute the average point alignment error (using only original inputs)
     
@@ -1101,8 +1152,10 @@ from loop_utils.alignment_torch import robust_weighted_estimate_sim3_torch
 
 def weighted_align_point_maps(point_map1, conf1, point_map2, conf2, conf_threshold, config, precompute_scale = None):
     """ point_map2 -> point_map1"""
-    b1, _, _, _ = point_map1.shape
-    b2, _, _, _ = point_map2.shape
+    # b1, _, _, _ = point_map1.shape
+    # b2, _, _, _ = point_map2.shape
+    b1 = point_map1.shape[0]
+    b2 = point_map2.shape[0]
     b = min(b1, b2)
 
     if precompute_scale is not None: # meaning we are using align method 'scale+se3'
@@ -1131,6 +1184,8 @@ def weighted_align_point_maps(point_map1, conf1, point_map2, conf2, conf_thresho
         confidence_weights.append(combined_conf)
 
     if len(aligned_points1) == 0:
+        print("No matching point pairs were found!")
+        return 1.0, np.eye(3, dtype=np.float32), np.zeros(3, dtype=np.float32)
         raise ValueError("No matching point pairs were found!")
 
     all_pts1 = np.concatenate(aligned_points1, axis=0)
